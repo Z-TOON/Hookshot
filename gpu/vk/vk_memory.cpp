@@ -32,6 +32,7 @@
 #include "import_hold.h"
 #include "import_fence.h"
 #include "mirror_trim.h"
+#include "mirror_overflow.h"
 #include "wb_learn.h"
 #include "mirror_inherit.h"
 #include "retired_give_back.h"
@@ -72,6 +73,7 @@ struct Pool {
     VkBuffer mirror = VK_NULL_HANDLE;
     VmaAllocation mirror_alloc = nullptr;
     uint64_t mirror_retry_epoch = 0;   // (non-zero when refused due to transient VRAM budget: retry once past this epoch)
+    mirror_overflow::Count refused;    // (hookshot: the submissions that bound it and found the mirrors' budget full, mirror_overflow.h)
     uint32_t synced_gen = 0;     // every page stamped up to this generation is in the mirror
     uint64_t synced_epoch = 0;   // the submission that last brought it up to date
     uint64_t sync_seg = 0;       // (and the parallel replay's segment whose uploads did)
@@ -3761,7 +3763,32 @@ bool mirror_make(Pool& pool) {
         static const bool tight_rule = env_on("RX_VK_MIRROR_TIGHT");
         uint64_t used = 0, allowed = 0;
         const bool tight = tight_rule && vram_usage(&used, &allowed) && allowed && used > allowed / 100 * 90;
-        if (mirror_bytes + n > mirror_budget() || n > (1ull << 30) || tight) {
+        // (hookshot) a busy pool the budget refuses is made past it while the card has room: mirror_overflow.h. RX_VK_MIRROR_OVERFLOW=0:
+        // refused, as before
+        bool over = false;
+        if (mirror_bytes + n > mirror_budget() && n <= (1ull << 30) && !tight) {
+            static const bool overflow_on = [] {
+                const char* v = getenv("RX_VK_MIRROR_OVERFLOW");
+                return !v || !env_value_off(v);
+            }();
+            mirror_overflow::note(p->refused, mirror_epoch);
+            if (overflow_on && mirror_overflow::busy(p->refused, mirror_epoch)) {
+                uint64_t now = 0, may = 0;
+                const bool known = vram_usage(&now, &may);
+                over = mirror_overflow::allowed(p->refused, mirror_epoch, n, mirror_bytes, mirror_budget(), known, now, may);
+                static int logged;
+                if (logged++ < 16)
+                    logf("vk: pool %#llx (%llu MB) was bound in %u of the last %llu submissions with no room in the mirrors' budget "
+                         "(%llu MB of %llu): %s (VRAM %llu of %llu MB; RX_VK_MIRROR_OVERFLOW=0: off)", (unsigned long long)p->lo,
+                         (unsigned long long)(n >> 20), (unsigned)p->refused.n,
+                         (unsigned long long)(mirror_epoch - p->refused.first + 1), (unsigned long long)(mirror_bytes >> 20),
+                         (unsigned long long)(mirror_budget() >> 20),
+                         over ? "its mirror is made past the budget" : "no room on the card either, it stays in system memory",
+                         (unsigned long long)(now >> 20), (unsigned long long)(may >> 20));
+                if (!over) p->refused = {};   // (looked at again after another kHot submissions, not at every one)
+            }
+        }
+        if (!over && (mirror_bytes + n > mirror_budget() || n > (1ull << 30) || tight)) {
             p->mstate = n > (1ull << 30) ? Pool::MIRROR_REFUSED : Pool::MIRROR_NONE;
             if (n > (1ull << 30)) p->mirror_retry_epoch = 0;
             static int logged;
@@ -3777,6 +3804,7 @@ bool mirror_make(Pool& pool) {
             return false;
         }
         p->mirror_retry_epoch = 0;
+        p->refused = {};
         {   // (hookshot) the page table points at the mirror: what the GPU wrote is there, and guest memory has it only after the write-back
             VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             da.buffer = p->mirror;
