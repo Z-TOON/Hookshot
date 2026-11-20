@@ -53,6 +53,7 @@
 #include "dlss_actor.h"
 #include "dlss_checks.h"
 #include "dlss_math.h"
+#include "input_margin.h"
 #include "temporal_jitter.h"
 #include "upscaler_rows.h"
 #include "vk_dlss.h"
@@ -300,7 +301,10 @@ bool make_image(VkCommandBuffer cmd, Image& im, VkFormat format, uint32_t w, uin
     VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ic.imageType = VK_IMAGE_TYPE_2D, ic.format = format, ic.extent = {w, h, 1}, ic.mipLevels = 1, ic.arrayLayers = 1;
     ic.samples = VK_SAMPLE_COUNT_1_BIT, ic.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | extra;
+    // (hookshot) a transfer's source and destination too: cleared when made, and the inputs' edge is repeated into their
+    // margin (pad_input)
+    ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+               VK_IMAGE_USAGE_TRANSFER_DST_BIT | extra;
     if (!create_image(ic, im.image, im.memory)) return im = {}, false;
     VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vc.image = im.image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format;
@@ -319,7 +323,46 @@ bool make_image(VkCommandBuffer cmd, Image& im, VkFormat format, uint32_t w, uin
     VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cmd, &di);
+    // (hookshot) cleared when made, as vk_reactive.cpp's mask is: an engine's inputs are as large as the largest render size it
+    // takes (DLSS at 2560x1440: 2560x1440 for a 1707x960 scene), and only the scene's part of them is ever written. The rest
+    // was whatever the video memory held before, which an upscaler's filters reach from the scene's last columns and rows:
+    // coloured lines along the picture's right and bottom edges. RX_VK_TEMPORAL_PAD=2: not cleared, as before, to see them
+    static const bool clear = env_switch("RX_VK_TEMPORAL_PAD") != 2;
+    const VkClearColorValue zero{};
+    if (clear) vkCmdClearColorImage(cmd, im.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &vc.subresourceRange);
     return true;
+}
+
+/// (hookshot) The scene's last column and row repeated into the margin of an engine's input (rw x rh written of an image that is
+/// larger: make_image), input_margin.h: what an upscaler's filters read past the scene's edge is then the edge itself, as a
+/// clamping sampler would give it, not the clear's black (a dark line at the edge) nor an earlier, larger frame's picture (the
+/// dynamic resolution stepping down). The copies read the scene's part alone and each writes its own part of the margin, so
+/// they go in one command with no barrier between them. Nothing to do when the scene fills the image
+void pad_input(VkCommandBuffer cmd, const Image& im, uint32_t rw, uint32_t rh) {
+    if (!im.image) return;
+    input_margin::Region copies[3];
+    const uint32_t n = input_margin::regions(rw, rh, im.width, im.height, copies);
+    if (!n) return;
+    // (a format this device does not blit, none of the three on the cards seen: its margin stays the clear's)
+    static std::unordered_map<int, bool> blits;
+    auto known = blits.find((int)im.format);
+    if (known == blits.end()) {
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, im.format, &fp);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        known = blits.emplace((int)im.format, (fp.optimalTilingFeatures & need) == need).first;
+    }
+    if (!known->second) return;
+    VkImageBlit regions[3];
+    for (uint32_t i = 0; i < n; i++) {
+        const input_margin::Region& c = copies[i];
+        VkImageBlit& r = regions[i];
+        r = {};
+        r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.srcOffsets[0] = {c.sx, c.sy, 0}, r.srcOffsets[1] = {c.sx + c.sw, c.sy + c.sh, 1};
+        r.dstOffsets[0] = {c.dx, c.dy, 0}, r.dstOffsets[1] = {c.dx + c.dw, c.dy + c.dh, 1};
+    }
+    vkCmdBlitImage(cmd, im.image, VK_IMAGE_LAYOUT_GENERAL, im.image, VK_IMAGE_LAYOUT_GENERAL, n, regions, VK_FILTER_NEAREST);
 }
 
 /// One compute pipeline with push descriptors (spec: its specialization constants, or none); what it made is destroyed
@@ -1163,6 +1206,17 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         pc.flags = 4;
         prep();
         full_barrier(cmd);
+    }
+    // (hookshot) the inputs' margin, where the engine asked for images larger than the scene (pad_input). RX_VK_TEMPORAL_PAD=0:
+    // left as the clear made it, for comparisons (2: and not cleared, make_image)
+    if (iw > rw || ih > rh) {
+        static const bool pad = env_switch("RX_VK_TEMPORAL_PAD") != 0 && env_switch("RX_VK_TEMPORAL_PAD") != 2;
+        if (pad) {
+            pad_input(cmd, s.color, rw, rh);
+            pad_input(cmd, s.depth, rw, rh);
+            pad_input(cmd, s.motion, rw, rh);
+            full_barrier(cmd);
+        }
     }
     TemporalFrame f;
     f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown(), f.output = s.output.shown();
